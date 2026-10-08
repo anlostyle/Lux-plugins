@@ -20,8 +20,11 @@ use tokio::{
 
 const PLUGIN_ID: &str = "org.lux.strm-media-info";
 const PLUGIN_NAME: &str = "strm媒体信息提取";
-const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const FFMPEG_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_FFPROBE_TIMEOUT_SECONDS: i64 = 30;
+const DEFAULT_FFMPEG_TIMEOUT_SECONDS: i64 = 60;
+const MIN_TIMEOUT_SECONDS: i64 = 1;
+const MAX_FFPROBE_TIMEOUT_SECONDS: i64 = 600;
+const MAX_FFMPEG_TIMEOUT_SECONDS: i64 = 900;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
@@ -38,6 +41,17 @@ struct MediaProbeRequest {
     include_thumbnail: bool,
     #[serde(default = "default_thumbnail_position_percent")]
     thumbnail_position_percent: i64,
+    /// Per-ffprobe-run limit in seconds, supplied by the host from the plugin settings.
+    #[serde(default)]
+    ffprobe_timeout_seconds: Option<i64>,
+    /// Limit in seconds for extracting the thumbnail frame with ffmpeg.
+    #[serde(default)]
+    ffmpeg_timeout_seconds: Option<i64>,
+}
+
+/// Seconds from the host settings, clamped to a sane range; the built-in default when absent.
+fn timeout_from_seconds(value: Option<i64>, default: i64, max: i64) -> Duration {
+    Duration::from_secs(value.unwrap_or(default).clamp(MIN_TIMEOUT_SECONDS, max) as u64)
 }
 
 fn default_media_info_enabled() -> bool {
@@ -407,15 +421,25 @@ async fn probe(params: Value) -> Result<Value, PluginRpcError> {
             message: "thumbnail position percent is invalid".to_owned(),
         });
     }
+    let ffprobe_timeout = timeout_from_seconds(
+        request.ffprobe_timeout_seconds,
+        DEFAULT_FFPROBE_TIMEOUT_SECONDS,
+        MAX_FFPROBE_TIMEOUT_SECONDS,
+    );
+    let ffmpeg_timeout = timeout_from_seconds(
+        request.ffmpeg_timeout_seconds,
+        DEFAULT_FFMPEG_TIMEOUT_SECONDS,
+        MAX_FFMPEG_TIMEOUT_SECONDS,
+    );
     let result = if request.include_media_info {
-        run_ffprobe(&request.url).await?
+        run_ffprobe(&request.url, ffprobe_timeout).await?
     } else {
         empty_media_result()
     };
     let duration_ticks = if request.include_thumbnail {
         match result.duration_ticks {
             Some(duration_ticks) => Some(duration_ticks),
-            None => Some(run_ffprobe_duration(&request.url).await?),
+            None => Some(run_ffprobe_duration(&request.url, ffprobe_timeout).await?),
         }
     } else {
         None
@@ -427,6 +451,7 @@ async fn probe(params: Value) -> Result<Value, PluginRpcError> {
                 &request.url,
                 &thumbnail_timestamp(duration_ticks, request.thumbnail_position_percent)
                     .ok_or_else(duration_error)?,
+                ffmpeg_timeout,
             )
             .await?,
         )
@@ -440,7 +465,7 @@ async fn probe(params: Value) -> Result<Value, PluginRpcError> {
     })
 }
 
-async fn run_ffprobe(url: &str) -> Result<MediaProbeResult, PluginRpcError> {
+async fn run_ffprobe(url: &str, limit: Duration) -> Result<MediaProbeResult, PluginRpcError> {
     let binary = ffprobe_binary()?;
     let mut child = Command::new(binary)
         .args([
@@ -459,7 +484,7 @@ async fn run_ffprobe(url: &str) -> Result<MediaProbeResult, PluginRpcError> {
         .map_err(|_| process_error())?;
     let mut stdout = child.stdout.take().ok_or_else(process_error)?;
     let mut stderr = child.stderr.take().ok_or_else(process_error)?;
-    let output = timeout(FFPROBE_TIMEOUT, async {
+    let output = timeout(limit, async {
         let (stdout_read, stderr_read, status) = tokio::try_join!(
             read_limited(&mut stdout, MAX_OUTPUT_BYTES, process_error, output_error),
             read_limited(&mut stderr, MAX_ERROR_BYTES, process_error, output_error),
@@ -475,7 +500,7 @@ async fn run_ffprobe(url: &str) -> Result<MediaProbeResult, PluginRpcError> {
     parse_probe_json(&output.1).map_err(map_probe_error)
 }
 
-async fn run_ffprobe_duration(url: &str) -> Result<i64, PluginRpcError> {
+async fn run_ffprobe_duration(url: &str, limit: Duration) -> Result<i64, PluginRpcError> {
     let binary = ffprobe_binary()?;
     let mut child = Command::new(binary)
         .args([
@@ -494,7 +519,7 @@ async fn run_ffprobe_duration(url: &str) -> Result<i64, PluginRpcError> {
         .map_err(|_| duration_process_error())?;
     let mut stdout = child.stdout.take().ok_or_else(duration_process_error)?;
     let mut stderr = child.stderr.take().ok_or_else(duration_process_error)?;
-    let output = timeout(FFPROBE_TIMEOUT, async {
+    let output = timeout(limit, async {
         let (stdout_read, stderr_read, status) = tokio::try_join!(
             read_limited(
                 &mut stdout,
@@ -520,7 +545,11 @@ async fn run_ffprobe_duration(url: &str) -> Result<i64, PluginRpcError> {
     parse_duration_probe(&output.1).ok_or_else(duration_error)
 }
 
-async fn run_ffmpeg_thumbnail(url: &str, timestamp: &str) -> Result<Vec<u8>, PluginRpcError> {
+async fn run_ffmpeg_thumbnail(
+    url: &str,
+    timestamp: &str,
+    limit: Duration,
+) -> Result<Vec<u8>, PluginRpcError> {
     let binary = ffmpeg_binary()?;
     let mut child = Command::new(binary)
         .args([
@@ -552,7 +581,7 @@ async fn run_ffmpeg_thumbnail(url: &str, timestamp: &str) -> Result<Vec<u8>, Plu
         .map_err(|_| thumbnail_process_error())?;
     let mut stdout = child.stdout.take().ok_or_else(thumbnail_process_error)?;
     let mut stderr = child.stderr.take().ok_or_else(thumbnail_process_error)?;
-    let output = timeout(FFMPEG_TIMEOUT, async {
+    let output = timeout(limit, async {
         let (stdout_read, stderr_read, status) = tokio::try_join!(
             read_limited(
                 &mut stdout,
@@ -887,5 +916,50 @@ mod tests {
         assert_eq!(result["statusCode"], 200);
         assert_eq!(result["mediaInfoImport"]["target"]["itemId"], "media-id");
         assert!(result["mediaInfoImport"]["target"].get("path").is_none());
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_default_when_the_host_sends_nothing() {
+        assert_eq!(
+            timeout_from_seconds(
+                None,
+                DEFAULT_FFPROBE_TIMEOUT_SECONDS,
+                MAX_FFPROBE_TIMEOUT_SECONDS
+            ),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            timeout_from_seconds(
+                None,
+                DEFAULT_FFMPEG_TIMEOUT_SECONDS,
+                MAX_FFMPEG_TIMEOUT_SECONDS
+            ),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn configured_timeouts_are_used_and_clamped_to_the_allowed_range() {
+        assert_eq!(
+            timeout_from_seconds(Some(120), 30, 600),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            timeout_from_seconds(Some(0), 30, 600),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            timeout_from_seconds(Some(-5), 30, 600),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            timeout_from_seconds(Some(100_000), 30, 600),
+            Duration::from_secs(600)
+        );
     }
 }

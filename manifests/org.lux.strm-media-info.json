@@ -25,6 +25,8 @@
     {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
     {"key": "thumbnailPositionPercent", "label": "缩略图位置", "type": "number", "required": true, "defaultValue": 30, "minimum": 1, "maximum": 99},
     {"key": "writeSidecars", "label": "写入 mediainfo.json", "type": "toggle", "defaultValue": true},
+    {"key": "ffprobeTimeoutSeconds", "label": "ffprobe 单次超时（秒）", "type": "number", "defaultValue": 30, "minimum": 10, "maximum": 600, "description": "单次 ffprobe 读取媒体信息或时长的最长等待时间。冷读取 115 等网盘上的大文件容易超过默认值，出现“media probe timed out”时建议调到 60～120。"},
+    {"key": "ffmpegTimeoutSeconds", "label": "ffmpeg 截图超时（秒）", "type": "number", "defaultValue": 60, "minimum": 10, "maximum": 900, "description": "截取一帧缩略图的最长等待时间。网盘大文件建议调到 120～240。"},
     {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
   ],
   "permissions": {"network": ["media-source"], "filesystem": []},
