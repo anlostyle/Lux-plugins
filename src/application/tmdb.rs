@@ -730,7 +730,7 @@ impl TmdbClient {
             ("language", language.trim().to_owned()),
             (
                 "include_image_language",
-                format!("{},en,null", language.trim()),
+                tmdb_image_languages(language, None),
             ),
         ];
         self.request_json(&endpoint, &params).await
@@ -770,7 +770,7 @@ impl TmdbClient {
             ("language", language.trim().to_owned()),
             (
                 "include_image_language",
-                format!("{},en,null", language.trim()),
+                tmdb_image_languages(language, None),
             ),
         ];
         self.request_json(&endpoint, &params).await
@@ -813,7 +813,7 @@ impl TmdbClient {
             ("language", language.trim().to_owned()),
             (
                 "include_image_language",
-                format!("{},en,null", language.trim()),
+                tmdb_image_languages(language, None),
             ),
         ];
         self.request_json(&endpoint, &params).await
@@ -1567,6 +1567,47 @@ fn validate_pagination(page: i32, total_pages: i32, total_results: i32) -> Resul
     Ok(())
 }
 
+/// Value for TMDb's `include_image_language`.
+///
+/// TMDb tags images with two-letter ISO 639-1 codes (`zh`, `en`, `cn` for Cantonese, ...) or
+/// `null`, not with locales like `zh-CN`; passing the configured locale verbatim matched nothing
+/// but `en`/`null`, so Chinese and Hong Kong posters were never returned. Use the primary
+/// language subtag, add `cn` for Chinese, always keep `en` and `null`, and add the title's original
+/// language when it is known.
+pub(crate) fn tmdb_image_languages(language: &str, original_language: Option<&str>) -> String {
+    fn primary(value: &str) -> String {
+        value
+            .trim()
+            .split(['-', '_'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    }
+    let mut languages = Vec::<String>::new();
+    let mut push = |value: String| {
+        if !value.is_empty() && !languages.contains(&value) {
+            languages.push(value);
+        }
+    };
+    let main = primary(language);
+    push(main.clone());
+    if main == "zh" {
+        push("cn".to_owned());
+    }
+    push("en".to_owned());
+    push("null".to_owned());
+    if let Some(original) = original_language {
+        let original = primary(original);
+        if original == "zh" {
+            push("zh".to_owned());
+            push("cn".to_owned());
+        } else {
+            push(original);
+        }
+    }
+    languages.join(",")
+}
+
 pub(crate) fn validate_id_language(
     id: i64,
     language: &str,
@@ -1864,5 +1905,43 @@ mod tests {
                 .expect("TMDb alternative titles response should decode");
 
         assert_eq!(response.results[0].title.as_deref(), Some("中文标题"));
+    }
+}
+
+#[cfg(test)]
+mod image_language_tests {
+    use super::tmdb_image_languages;
+
+    #[test]
+    fn locale_is_reduced_to_the_iso_639_1_code_tmdb_uses_for_images() {
+        assert_eq!(tmdb_image_languages("zh-CN", None), "zh,cn,en,null");
+        assert_eq!(tmdb_image_languages("zh-TW", None), "zh,cn,en,null");
+        assert_eq!(tmdb_image_languages("en-US", None), "en,null");
+        assert_eq!(tmdb_image_languages("ja-JP", None), "ja,en,null");
+        assert_eq!(tmdb_image_languages("pt_BR", None), "pt,en,null");
+    }
+
+    #[test]
+    fn empty_language_still_keeps_the_english_and_unlabelled_fallbacks() {
+        assert_eq!(tmdb_image_languages("", None), "en,null");
+        assert_eq!(tmdb_image_languages("  ", None), "en,null");
+    }
+
+    #[test]
+    fn the_original_language_is_added_once() {
+        assert_eq!(
+            tmdb_image_languages("zh-CN", Some("ja")),
+            "zh,cn,en,null,ja"
+        );
+        assert_eq!(tmdb_image_languages("en-US", Some("en")), "en,null");
+        assert_eq!(tmdb_image_languages("en-US", Some("zh")), "en,null,zh,cn");
+        assert_eq!(tmdb_image_languages("zh-CN", Some("cn")), "zh,cn,en,null");
+    }
+
+    #[test]
+    fn a_hong_kong_poster_tagged_cn_is_covered_by_the_default_request() {
+        let included = tmdb_image_languages("zh-CN", None);
+        assert!(included.split(',').any(|code| code == "cn"));
+        assert!(!included.contains("zh-CN"));
     }
 }
